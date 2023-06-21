@@ -8,6 +8,7 @@
 #pragma once
 
 #include <vector>
+#include <memory>
 #include <unordered_set>
 #include <assert.h>
 #include <zlib.h>
@@ -59,21 +60,138 @@ struct TileLocation {
 /// A quick and dirty, thread-safe delta generator for last tile changes
 class DeltaGenerator {
 
+    friend class DeltaTests;
+
     // fast - and deltas take lots of size off.
     static const int compressionLevel = -3;
 
     /// Bitmap row with a CRC for quick vertical shift detection
-    struct DeltaBitmapRow {
-        // FIXME: add "whole row the same" flag.
-        uint64_t        _crc;
-        const uint32_t *_pixels; // FIXME: remove me.
-        size_t          _pixSize;
+    class DeltaBitmapRow final {
+        size_t _rleSize;
+        uint64_t _rleMask[256/64];
+        uint32_t *_rleData;
+    public:
+        class PixIterator final
+        {
+            const DeltaBitmapRow &_row;
+            unsigned int _x;
+            const uint32_t *_rlePtr;
+        public:
+            PixIterator(const DeltaBitmapRow &row)
+                : _row(row), _x(0),
+                  _rlePtr(row._rleData)
+            {
+            }
+            uint32_t getPixel() const
+            {
+                return *_rlePtr;
+            }
+            bool identical(const PixIterator &i) const
+            {
+                return getPixel() == i.getPixel();
+            }
+            void next()
+            {
+                _x++;
+                if (!(_row._rleMask[_x>>6] & (uint64_t(1) << (_x & 63))))
+                    _rlePtr++;
+            }
+        };
+
+
+        DeltaBitmapRow()
+            : _rleSize(0)
+            , _rleData(nullptr)
+        {
+            memset(_rleMask, 0, sizeof(_rleMask));
+        }
+        DeltaBitmapRow(const DeltaBitmapRow&) = delete;
+
+        ~DeltaBitmapRow()
+        {
+            if (_rleData)
+                free(_rleData);
+        }
+
+        void initRow(const uint32_t *from, unsigned int width)
+        {
+            uint32_t scratch[width];
+
+            unsigned int outp = 0;
+            scratch[0] = from[0];
+            _rleMask[0] = 1;
+            for (unsigned int x = 1; x < width; ++x)
+            {
+                if (from[x] == scratch[outp]) // set for run
+                    _rleMask[x>>6] |= uint64_t(1) << (x & 63);
+                else
+                    scratch[++outp] = from[x];
+            }
+            _rleSize = ++outp;
+            _rleData = (uint32_t *)malloc((size_t)_rleSize * 4);
+            memcpy(_rleData, scratch, _rleSize * 4);
+        }
 
         bool identical(const DeltaBitmapRow &other) const
         {
-            if (_crc != other._crc)
+            if (_rleSize != other._rleSize)
                 return false;
-            return !std::memcmp(_pixels, other._pixels, _pixSize * 4);
+            if (memcmp(_rleMask, other._rleMask, sizeof(_rleMask)))
+                return false;
+            return !std::memcmp(_rleData, other._rleData, _rleSize * 4);
+        }
+
+        // Create a diff from our state to new state in curRow
+        void diffRowTo(const DeltaBitmapRow &curRow,
+                       const int width, const int curY,
+                       std::vector<uint8_t> &output) const
+        {
+            PixIterator oldPixels(*this);
+            PixIterator curPixels(curRow);
+            for (int x = 0; x < width;)
+            {
+                int same;
+                for (same = 0; same + x < width &&
+                         oldPixels.identical(curPixels);)
+                {
+                    oldPixels.next();
+                    curPixels.next();
+                    same++;
+                }
+
+                x += same;
+
+                uint32_t scratch[256];
+
+                int diff;
+                for (diff = 0; diff + x < width &&
+                         (!oldPixels.identical(curPixels) || diff < 3)
+                         && diff < 254;)
+                {
+                    oldPixels.next();
+                    scratch[diff] = curPixels.getPixel();
+                    curPixels.next();
+                    ++diff;
+                }
+
+                if (diff > 0)
+                {
+                    output.push_back('d');
+                    output.push_back(curY);
+                    output.push_back(x);
+                    output.push_back(diff);
+
+                    size_t dest = output.size();
+                    output.resize(dest + diff * 4);
+
+                    unpremult_copy(reinterpret_cast<unsigned char *>(&output[dest]),
+                                   (const unsigned char *)(scratch),
+                                   diff);
+
+                    LOG_TRC("row " << curY << " different " << diff << "pixels");
+                    x += diff;
+                }
+            }
         }
     };
 
@@ -82,23 +200,6 @@ class DeltaGenerator {
         // no careless copying
         DeltaData(const DeltaData&) = delete;
         DeltaData& operator=(const DeltaData&) = delete;
-
-        static inline uint64_t copyWithCrc(uint32_t *to, const uint32_t *from, unsigned int width)
-        {
-            assert ((width & 0x1) == 0); // copy 64bits at a time.
-
-            const uint64_t *src = reinterpret_cast<const uint64_t *>(from);
-            uint64_t *dest = reinterpret_cast<uint64_t *>(to);
-
-            // We get the hash ~for free as we copy - with a cheap hash.
-            uint64_t crc = 0x7fffffff - 1;
-            for (unsigned int x = 0; x < (width>>1); ++x)
-            {
-                crc = (crc << 7) + crc + src[x];
-                dest[x] = src[x];
-            }
-            return crc;
-        }
 
         DeltaData (TileWireId wid,
                    unsigned char* pixmap, size_t startX, size_t startY,
@@ -122,24 +223,17 @@ class DeltaGenerator {
                     << (width * height * 4) << " width " << width
                     << " height " << height);
 
-            _pixels = (uint32_t *)malloc((size_t)width * height * 4);
             for (int y = 0; y < height; ++y)
             {
                 size_t position = ((startY + y) * bufferWidth * 4) + (startX * 4);
                 DeltaBitmapRow &row = _rows[y];
-                row._pixels = _pixels + width * y;
-                row._pixSize = width;
-                row._crc = copyWithCrc(
-                    const_cast<uint32_t *>(row._pixels),
-                    reinterpret_cast<uint32_t *>(pixmap + position), width);
+                row.initRow(reinterpret_cast<uint32_t *>(pixmap + position), width);
             }
         }
 
         ~DeltaData()
         {
             delete[] _rows;
-            if (_pixels)
-                free (_pixels);
         }
 
         void setWid(TileWireId wid)
@@ -191,9 +285,6 @@ class DeltaGenerator {
             delete[] _rows;
             _rows = repl->_rows;
             repl->_rows = nullptr;
-            free (_pixels);
-            _pixels = repl->_pixels;
-            repl->_pixels = nullptr;
             repl.reset();
         }
 
@@ -215,7 +306,6 @@ class DeltaGenerator {
         TileWireId _wid;
         int _width;
         int _height;
-        uint32_t *_pixels;
         DeltaBitmapRow *_rows;
     };
 
@@ -376,40 +466,7 @@ class DeltaGenerator {
                 continue;
 
             // Our row is just that different:
-            const DeltaBitmapRow &curRow = cur.getRow(y);
-            const DeltaBitmapRow &prevRow = prev.getRow(y);
-            for (int x = 0; x < prev.getWidth();)
-            {
-                int same;
-                for (same = 0; same + x < prev.getWidth() &&
-                         prevRow._pixels[x+same] == curRow._pixels[x+same];)
-                    ++same;
-
-                x += same;
-
-                int diff;
-                for (diff = 0; diff + x < prev.getWidth() &&
-                         (prevRow._pixels[x+diff] != curRow._pixels[x+diff] || diff < 3) &&
-                         diff < 254;)
-                    ++diff;
-                if (diff > 0)
-                {
-                    output.push_back('d');
-                    output.push_back(y);
-                    output.push_back(x);
-                    output.push_back(diff);
-
-                    size_t dest = output.size();
-                    output.resize(dest + diff * 4);
-
-                    unpremult_copy(reinterpret_cast<unsigned char *>(&output[dest]),
-                                   (const unsigned char *)(curRow._pixels + x),
-                                   diff);
-
-                    LOG_TRC("row " << y << " different " << diff << "pixels");
-                    x += diff;
-                }
-            }
+            prev.getRow(y).diffRowTo(cur.getRow(y), prev.getWidth(), y, output);
         }
         LOG_TRC("Created delta of size " << output.size());
         if (output.empty())
